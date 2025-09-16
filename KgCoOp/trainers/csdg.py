@@ -61,41 +61,34 @@ def _build_prompt_cfg(cfg, cfg_node):
     return cfg_adapter
 
 
-class ContentPromptLearner(nn.Module):
+class ContentPromptLearner(KgCoOpPromptLearner):
     def __init__(self, cfg, cfg_node, classnames, clip_model):
-        super().__init__()
         prompt_cfg = _build_prompt_cfg(cfg, cfg_node)
-        self.prompt = KgCoOpPromptLearner(prompt_cfg, classnames, clip_model)
-        self.tokenized_prompts = self.prompt.tokenized_prompts
-        zeroshot = self.prompt.text_features.detach().clone()
+        super().__init__(prompt_cfg, classnames, clip_model)
+        zeroshot = self.text_features.detach().clone()
         self.register_buffer('zeroshot_features', zeroshot.to(dtype=clip_model.dtype))
 
-    def forward(self):
-        return self.prompt()
 
-
-class StylePromptLearner(nn.Module):
+class StylePromptLearner(CoOpPromptLearner):
     def __init__(self, cfg, cfg_node, classnames, clip_model):
-        super().__init__()
         prompt_cfg = _build_prompt_cfg(cfg, cfg_node)
-        self.prompt = CoOpPromptLearner(prompt_cfg, classnames, clip_model)
-        self.tokenized_prompts = self.prompt.tokenized_prompts
+        super().__init__(prompt_cfg, classnames, clip_model)
         dropout = getattr(cfg_node, 'DROPOUT', 0.0)
-        self.dropout = nn.Dropout(dropout) if dropout > 0 else None
+        self.dropout_layer = nn.Dropout(dropout) if dropout > 0 else None
         self.domain_embed = None
         self._domain_debug_printed = False
         if getattr(cfg_node, 'USE_DOMAIN_ID', False):
             emb_dim = cfg_node.DOMAIN_EMB_DIM
             num_domains = len(cfg.DATASET.SOURCE_DOMAINS)
             self.domain_embed = nn.Embedding(num_domains, emb_dim)
-            ctx_dim = self.prompt.ctx.shape[-1]
-            self.domain_proj = nn.Linear(emb_dim, self.prompt.n_ctx * ctx_dim)
+            ctx_dim = self.ctx.shape[-1]
+            self.domain_proj = nn.Linear(emb_dim, self.n_ctx * ctx_dim)
 
     def forward(self, domain_ids: Optional[torch.Tensor] = None):
-        shared_prompts = self.prompt()
+        shared_prompts = super().forward()
         if self.domain_embed is None or domain_ids is None:
-            if self.dropout is not None:
-                shared_prompts = self.dropout(shared_prompts)
+            if self.dropout_layer is not None:
+                shared_prompts = self.dropout_layer(shared_prompts)
             return {
                 'shared_prompts': shared_prompts,
                 'per_domain_prompts': None,
@@ -111,8 +104,8 @@ class StylePromptLearner(nn.Module):
                     "falling back to shared style prompts."
                 )
                 self._domain_overflow_warned = True
-            if self.dropout is not None:
-                shared_prompts = self.dropout(shared_prompts)
+            if self.dropout_layer is not None:
+                shared_prompts = self.dropout_layer(shared_prompts)
             return {
                 'shared_prompts': shared_prompts,
                 'per_domain_prompts': None,
@@ -126,27 +119,27 @@ class StylePromptLearner(nn.Module):
             print(f"[CSDG] unique domain ids in batch: {unique_domains.tolist()}")
             self._domain_debug_printed = True
 
-        ctx = self.prompt.ctx
+        ctx = self.ctx
         if ctx.dim() == 2:
-            ctx = ctx.unsqueeze(0).expand(self.prompt.n_cls, -1, -1)
+            ctx = ctx.unsqueeze(0).expand(self.n_cls, -1, -1)
 
         per_domain_prompts = []
         for dom_id in unique_domains:
             emb = self.domain_embed(dom_id)
             bias = self.domain_proj(emb).to(ctx.dtype)
-            bias = bias.view(self.prompt.n_ctx, -1)
+            bias = bias.view(self.n_ctx, -1)
             ctx_shifted = ctx + bias.unsqueeze(0)
-            prompts_dom = self.prompt.construct_prompts(
+            prompts_dom = self.construct_prompts(
                 ctx_shifted,
-                self.prompt.token_prefix,
-                self.prompt.token_suffix
+                self.token_prefix,
+                self.token_suffix
             )
             per_domain_prompts.append(prompts_dom)
 
         per_domain_prompts = torch.stack(per_domain_prompts)
-        if self.dropout is not None:
-            shared_prompts = self.dropout(shared_prompts)
-            per_domain_prompts = self.dropout(per_domain_prompts)
+        if self.dropout_layer is not None:
+            shared_prompts = self.dropout_layer(shared_prompts)
+            per_domain_prompts = self.dropout_layer(per_domain_prompts)
 
         return {
             'shared_prompts': shared_prompts,
