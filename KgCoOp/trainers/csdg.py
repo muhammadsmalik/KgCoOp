@@ -187,7 +187,7 @@ class CSDGModel(nn.Module):
         content_logits = self.logit_scale.exp() * image_feats @ content_features.t()
 
         # Style stream
-        style_prompts = self.style_prompt(domain_ids)
+        style_prompts = self.style_prompt()
         style_features = self.encode_text(style_prompts)
         style_features = style_features / style_features.norm(dim=-1, keepdim=True)
         style_logits = self.logit_scale.exp() * image_feats @ style_features.t()
