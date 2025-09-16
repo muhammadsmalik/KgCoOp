@@ -44,9 +44,13 @@ TRAINER:
     GATE:
       INIT_BIAS: 0.0
       DETACH_STYLE_GRAD: False
+      BIAS_TARGET: null
+      BIAS_TARGET_EPOCH: null
     LOSS:
       STYLE_DECORR_WEIGHT: 0.1
       GATE_ENT_WEIGHT: 0.05
       STYLE_CE_WEIGHT: 0.05
+      GATE_ENT_WEIGHT_TARGET: null
+      GATE_ENT_WEIGHT_TARGET_EPOCH: null
 
 OUTPUT_DIR: outputs/csdg_office_home_clipart_standard

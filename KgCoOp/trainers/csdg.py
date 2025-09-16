@@ -189,10 +189,7 @@ class GateModule(nn.Module):
         self.temperature = cfg.TRAINER.CSDG.GATE.SIGMOID_TEMPERATURE
 
         init_bias = cfg.TRAINER.CSDG.GATE.INIT_BIAS
-        with torch.no_grad():
-            self.mlp[-1].bias.zero_()
-            self.mlp[-1].bias[0] = init_bias
-            self.mlp[-1].bias[1] = -init_bias
+        self.set_bias(init_bias)
 
     def forward(self, image_feats: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         """Return softmax weights (content, style) and raw logits."""
@@ -200,6 +197,13 @@ class GateModule(nn.Module):
         logits = self.mlp(image_feats.to(dtype))
         weights = F.softmax(logits / self.temperature, dim=-1)
         return weights, logits
+
+    def set_bias(self, content_bias: float):
+        """Update the terminal logits bias to favour content/style."""
+        with torch.no_grad():
+            self.mlp[-1].bias.zero_()
+            self.mlp[-1].bias[0] = content_bias
+            self.mlp[-1].bias[1] = -content_bias
 
 
 class CSDGModel(nn.Module):
@@ -335,6 +339,54 @@ class CSDG(TrainerX):
         self.sched = build_lr_scheduler(self.optim, cfg.OPTIM)
         self.register_model("csdg", self.model, self.optim, self.sched)
 
+        loss_cfg = cfg.TRAINER.CSDG.LOSS
+        gate_cfg = cfg.TRAINER.CSDG.GATE
+        self._gate_bias_start = gate_cfg.INIT_BIAS
+        self._gate_bias_target = getattr(gate_cfg, "BIAS_TARGET", None)
+        self._gate_bias_target_epoch = getattr(gate_cfg, "BIAS_TARGET_EPOCH", None)
+        self._gate_bias_last = None
+
+        self._gate_ent_start = loss_cfg.GATE_ENT_WEIGHT
+        self._gate_ent_target = getattr(loss_cfg, "GATE_ENT_WEIGHT_TARGET", None)
+        self._gate_ent_target_epoch = getattr(loss_cfg, "GATE_ENT_WEIGHT_TARGET_EPOCH", None)
+        self.current_gate_ent_weight = self._gate_ent_start
+        self._gate_ent_last = None
+
+    def before_train(self):
+        super().before_train()
+        self._apply_gate_schedule(epoch=0)
+
+    def before_epoch(self):
+        super().before_epoch()
+        self._apply_gate_schedule(epoch=self.epoch)
+
+    def _apply_gate_schedule(self, epoch: int):
+        bias = self._gate_bias_start
+        if (
+            self._gate_bias_target is not None
+            and self._gate_bias_target_epoch is not None
+            and epoch >= self._gate_bias_target_epoch
+        ):
+            bias = self._gate_bias_target
+        self.model.gate.set_bias(bias)
+        if self._gate_bias_last != bias:
+            print(f"[CSDG] gate bias set to {bias:.4f} at epoch {epoch}")
+            self._gate_bias_last = bias
+
+        ent_weight = self._gate_ent_start
+        if (
+            self._gate_ent_target is not None
+            and self._gate_ent_target_epoch is not None
+            and epoch >= self._gate_ent_target_epoch
+        ):
+            ent_weight = self._gate_ent_target
+        self.current_gate_ent_weight = ent_weight
+        if self._gate_ent_last != ent_weight:
+            print(
+                f"[CSDG] gate entropy weight set to {ent_weight:.4f} at epoch {epoch}"
+            )
+            self._gate_ent_last = ent_weight
+
     def forward_backward(self, batch):
         """Compute losses, apply gradients, and log diagnostics."""
         images = batch["img"].to(self.device)
@@ -363,7 +415,7 @@ class CSDG(TrainerX):
             decor_loss = style_cos.pow(2).mean()
             losses["decor"] = decor_weight * decor_loss
 
-        gate_ent_weight = self.cfg.TRAINER.CSDG.LOSS.GATE_ENT_WEIGHT
+        gate_ent_weight = getattr(self, "current_gate_ent_weight", self.cfg.TRAINER.CSDG.LOSS.GATE_ENT_WEIGHT)
         if gate_ent_weight > 0:
             gate_weights = outputs["gate_weights"].clamp_min(1e-6)
             entropy = -(gate_weights * gate_weights.log()).sum(dim=1).mean()
