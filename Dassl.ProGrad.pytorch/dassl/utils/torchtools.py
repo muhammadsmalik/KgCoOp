@@ -107,7 +107,8 @@ def load_checkpoint(fpath):
     map_location = None if torch.cuda.is_available() else "cpu"
 
     try:
-        checkpoint = torch.load(fpath, map_location=map_location)
+        # PyTorch>=2.6 defaults to weights_only=True which breaks older scheduler pickles.
+        checkpoint = torch.load(fpath, map_location=map_location, weights_only=False)
 
     except UnicodeDecodeError:
         pickle.load = partial(pickle.load, encoding="latin1")

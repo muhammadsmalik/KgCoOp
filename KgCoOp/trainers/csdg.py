@@ -13,6 +13,8 @@ from dassl.optim import build_optimizer, build_lr_scheduler
 from clip import clip
 from clip.simple_tokenizer import SimpleTokenizer as _Tokenizer
 
+from .kgcoop import CUSTOM_TEMPLATES as KGCOOP_TEMPLATES
+
 _tokenizer = _Tokenizer()
 
 
@@ -107,7 +109,20 @@ class BasePromptLearner(nn.Module):
 
 
 class ContentPromptLearner(BasePromptLearner):
-    pass
+    def __init__(self, cfg, cfg_node, classnames, clip_model):
+        super().__init__(cfg, cfg_node, classnames, clip_model)
+
+        template_key = cfg.DATASET.NAME
+        anchor_template = KGCOOP_TEMPLATES.get(template_key, 'a photo of a {}.')
+        classnames_clean = [name.replace('_', ' ') for name in classnames]
+        prompts = [anchor_template.format(name) for name in classnames_clean]
+        tokenized = torch.cat([clip.tokenize(p) for p in prompts])
+        device = clip_model.token_embedding.weight.device
+        with torch.no_grad():
+            tokenized = tokenized.to(device)
+            text_features = clip_model.encode_text(tokenized)
+            text_features = text_features / text_features.norm(dim=-1, keepdim=True)
+        self.register_buffer('zeroshot_features', text_features.type(clip_model.dtype))
 
 
 class StylePromptLearner(BasePromptLearner):
@@ -189,13 +204,24 @@ class CSDGModel(nn.Module):
         content_logits = self.logit_scale.exp() * image_feats @ content_features.t()
 
         # Style stream
-        style_prompts = self.style_prompt()
+        style_domain = None
+        if domain_ids is not None and getattr(self.cfg.TRAINER.CSDG.STYLE, 'USE_DOMAIN_ID', False):
+            # TODO: per-sample domain conditioning once prompt replication is implemented
+            style_domain = None
+        style_prompts = self.style_prompt(style_domain)
         style_features = self.encode_text(style_prompts)
         style_features = style_features / style_features.norm(dim=-1, keepdim=True)
         style_logits = self.logit_scale.exp() * image_feats @ style_features.t()
 
         alpha, gate_logits = self.gate(image_feats)
-        fused_logits = content_logits  # TODO: apply gating fusion once losses ready
+        gate_weight = (1 - alpha).unsqueeze(-1)
+        style_logits_for_fusion = style_logits
+        if self.cfg.TRAINER.CSDG.GATE.DETACH_STYLE_GRAD:
+            style_logits_for_fusion = style_logits_for_fusion.detach()
+        fused_logits = content_logits + gate_weight * style_logits_for_fusion
+
+        zeroshot_features = self.content_prompt.zeroshot_features
+        zeroshot_logits = self.logit_scale.exp() * image_feats @ zeroshot_features.t()
 
         return {
             'logits': fused_logits,
@@ -205,7 +231,9 @@ class CSDGModel(nn.Module):
             'gate_logits': gate_logits,
             'content_features': content_features,
             'style_features': style_features,
-            'image_features': image_feats
+            'image_features': image_feats,
+            'zeroshot_features': zeroshot_features,
+            'zeroshot_logits': zeroshot_logits
         }
 
 
@@ -248,15 +276,70 @@ class CSDG(TrainerX):
 
         outputs = self.model(images, domain)
         logits = outputs['logits']
-        loss = F.cross_entropy(logits, labels)
+        losses = OrderedDict()
+        ce_loss = F.cross_entropy(logits, labels)
+        losses['ce'] = ce_loss
 
-        self.model_backward_and_update(loss, names='csdg')
+        anchor_weight = self.cfg.TRAINER.CSDG.CONTENT.ANCHOR_WEIGHT
+        if anchor_weight > 0:
+            content_feat = outputs['content_features']
+            zeroshot_feat = outputs['zeroshot_features']
+            anchor_loss = 1 - (content_feat * zeroshot_feat).sum(dim=-1).mean()
+            losses['anchor'] = anchor_weight * anchor_loss
 
-        loss_summary = {
-            'loss': loss.item(),
-            'acc': compute_accuracy(logits, labels)[0].item(),
-            'alpha_mean': outputs['alpha'].mean().item()
-        }
+        decor_weight = self.cfg.TRAINER.CSDG.LOSS.STYLE_DECORR_WEIGHT
+        if decor_weight > 0:
+            content_centered = outputs['content_features'] - outputs['content_features'].mean(dim=0, keepdim=True)
+            style_centered = outputs['style_features'] - outputs['style_features'].mean(dim=0, keepdim=True)
+            denom = max(content_centered.size(0) - 1, 1)
+            cross_cov = content_centered.t() @ style_centered / denom
+            decor_loss = cross_cov.pow(2).mean()
+            losses['decor'] = decor_weight * decor_loss
+
+        gate_ent_weight = self.cfg.TRAINER.CSDG.LOSS.GATE_ENT_WEIGHT
+        if gate_ent_weight > 0:
+            alpha = outputs['alpha']
+            alpha = alpha.clamp(1e-6, 1 - 1e-6)
+            entropy = -(alpha * alpha.log() + (1 - alpha) * (1 - alpha).log()).mean()
+            gate_loss = -entropy
+            losses['gate'] = gate_ent_weight * gate_loss
+
+        style_ce_weight = self.cfg.TRAINER.CSDG.LOSS.STYLE_CE_WEIGHT
+        if style_ce_weight > 0:
+            style_ce = F.cross_entropy(outputs['style_logits'], labels)
+            losses['style_ce'] = style_ce_weight * style_ce
+
+        zs_kl_weight = self.cfg.TRAINER.CSDG.LOSS.ZERO_SHOT_KL_WEIGHT
+        if zs_kl_weight > 0:
+            teacher = F.softmax(outputs['zeroshot_logits'].detach(), dim=1)
+            student_log = F.log_softmax(logits, dim=1)
+            kl = F.kl_div(student_log, teacher, reduction='batchmean')
+            losses['zero_shot_kl'] = zs_kl_weight * kl
+
+        total_loss = sum(losses.values())
+        self.model_backward_and_update(total_loss, names='csdg')
+
+        with torch.no_grad():
+            alpha = outputs['alpha']
+            loss_summary = {
+                'loss': total_loss.item(),
+                'loss_ce': ce_loss.item(),
+                'acc': compute_accuracy(logits, labels)[0].item(),
+                'alpha_mean': alpha.mean().item(),
+                'alpha_std': alpha.std(unbiased=False).item()
+            }
+
+            if anchor_weight > 0:
+                loss_summary['loss_anchor'] = (anchor_loss * anchor_weight).item()
+            if decor_weight > 0:
+                loss_summary['loss_decor'] = (decor_loss * decor_weight).item()
+            if gate_ent_weight > 0:
+                loss_summary['loss_gate'] = (gate_loss * gate_ent_weight).item()
+                loss_summary['gate_entropy'] = entropy.item()
+            if style_ce_weight > 0:
+                loss_summary['loss_style_ce'] = (style_ce * style_ce_weight).item()
+            if zs_kl_weight > 0:
+                loss_summary['loss_zero_shot_kl'] = (kl * zs_kl_weight).item()
 
         if (self.batch_idx + 1) == self.num_batches:
             self.sched.step()
