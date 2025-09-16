@@ -42,11 +42,11 @@ TRAINER:
     STYLE:
       USE_DOMAIN_ID: True
     GATE:
-      INIT_BIAS: 2.0
+      INIT_BIAS: 0.0
       DETACH_STYLE_GRAD: False
     LOSS:
       STYLE_DECORR_WEIGHT: 0.1
-      GATE_ENT_WEIGHT: 0.01
+      GATE_ENT_WEIGHT: 0.05
       STYLE_CE_WEIGHT: 0.05
 
 OUTPUT_DIR: outputs/csdg_office_home_clipart_standard

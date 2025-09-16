@@ -137,6 +137,7 @@ class StylePromptLearner(BasePromptLearner):
             self.domain_embed = nn.Embedding(num_domains, emb_dim)
             ctx_dim = self.ctx.shape[-1]
             self.domain_proj = nn.Linear(emb_dim, self.n_ctx * ctx_dim)
+        self._domain_debug_printed = False
 
     def forward(self, domain_ids: Optional[torch.Tensor] = None):
         shared_prompts = super().forward()
@@ -169,6 +170,9 @@ class StylePromptLearner(BasePromptLearner):
         device = shared_prompts.device
         domain_ids = domain_ids.to(device)
         unique_domains, inverse = domain_ids.unique(sorted=True, return_inverse=True)
+        if self.training and not self._domain_debug_printed:
+            print(f"[CSDG] unique domain ids in batch: {unique_domains.tolist()}")
+            self._domain_debug_printed = True
 
         per_domain_prompts = []
         ctx = self.ctx
