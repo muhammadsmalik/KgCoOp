@@ -136,18 +136,56 @@ class StylePromptLearner(BasePromptLearner):
             num_domains = len(cfg.DATASET.SOURCE_DOMAINS)
             self.domain_embed = nn.Embedding(num_domains, emb_dim)
             ctx_dim = self.ctx.shape[-1]
-            self.domain_proj = nn.Linear(emb_dim, ctx_dim)
+            self.domain_proj = nn.Linear(emb_dim, self.n_ctx * ctx_dim)
 
     def forward(self, domain_ids: Optional[torch.Tensor] = None):
-        prompts = super().forward()
-        if self.domain_embed is not None and domain_ids is not None:
-            emb = self.domain_embed(domain_ids)
+        shared_prompts = super().forward()
+        if self.domain_embed is None or domain_ids is None:
+            if self.dropout is not None:
+                shared_prompts = self.dropout(shared_prompts)
+            return {
+                'shared_prompts': shared_prompts,
+                'per_domain_prompts': None,
+                'domain_indices': None
+            }
+
+        max_domain = self.domain_embed.num_embeddings
+        if domain_ids.max().item() >= max_domain:
+            if self.dropout is not None:
+                shared_prompts = self.dropout(shared_prompts)
+            return {
+                'shared_prompts': shared_prompts,
+                'per_domain_prompts': None,
+                'domain_indices': None
+            }
+
+        device = shared_prompts.device
+        domain_ids = domain_ids.to(device)
+        unique_domains, inverse = domain_ids.unique(sorted=True, return_inverse=True)
+
+        per_domain_prompts = []
+        ctx = self.ctx
+        if ctx.dim() == 2:
+            ctx = ctx.unsqueeze(0).expand(self.n_cls, -1, -1)
+
+        for dom_id in unique_domains:
+            emb = self.domain_embed(dom_id)
             bias = self.domain_proj(emb)
-            bias = bias.unsqueeze(1).expand(-1, self.n_ctx, -1)
-            prompts = prompts + bias
+            bias = bias.view(self.n_ctx, -1)
+            ctx_shifted = ctx + bias.unsqueeze(0)
+            prompts = torch.cat([self.token_prefix, ctx_shifted, self.token_suffix], dim=1)
+            per_domain_prompts.append(prompts)
+
+        per_domain_prompts = torch.stack(per_domain_prompts)
         if self.dropout is not None:
-            prompts = self.dropout(prompts)
-        return prompts
+            shared_prompts = self.dropout(shared_prompts)
+            per_domain_prompts = self.dropout(per_domain_prompts)
+
+        return {
+            'shared_prompts': shared_prompts,
+            'per_domain_prompts': per_domain_prompts,
+            'domain_indices': inverse
+        }
 
 
 class GateModule(nn.Module):
@@ -204,14 +242,33 @@ class CSDGModel(nn.Module):
         content_logits = self.logit_scale.exp() * image_feats @ content_features.t()
 
         # Style stream
-        style_domain = None
-        if domain_ids is not None and getattr(self.cfg.TRAINER.CSDG.STYLE, 'USE_DOMAIN_ID', False):
-            # TODO: per-sample domain conditioning once prompt replication is implemented
-            style_domain = None
-        style_prompts = self.style_prompt(style_domain)
-        style_features = self.encode_text(style_prompts)
-        style_features = style_features / style_features.norm(dim=-1, keepdim=True)
-        style_logits = self.logit_scale.exp() * image_feats @ style_features.t()
+        style_out = self.style_prompt(domain_ids)
+        if style_out['per_domain_prompts'] is None:
+            style_prompts = style_out['shared_prompts']
+            style_features = self.encode_text(style_prompts)
+            style_features = style_features / style_features.norm(dim=-1, keepdim=True)
+            style_logits = self.logit_scale.exp() * image_feats @ style_features.t()
+            style_features_batch = style_features.unsqueeze(0).expand(image_feats.size(0), -1, -1)
+        else:
+            per_domain_prompts = style_out['per_domain_prompts']
+            domain_indices = style_out['domain_indices']
+            unique_feats = []
+            for idx in range(per_domain_prompts.size(0)):
+                prompts = per_domain_prompts[idx]
+                feats = self.encode_text(prompts)
+                feats = feats / feats.norm(dim=-1, keepdim=True)
+                unique_feats.append(feats)
+            unique_feats = torch.stack(unique_feats)
+            logit_list = []
+            style_feat_per_sample = []
+            for i, dom_idx in enumerate(domain_indices):
+                feats = unique_feats[dom_idx]
+                logits_i = self.logit_scale.exp() * image_feats[i] @ feats.t()
+                logit_list.append(logits_i)
+                style_feat_per_sample.append(feats)
+            style_logits = torch.stack(logit_list)
+            style_features_batch = torch.stack(style_feat_per_sample)
+            style_features = style_features_batch.mean(dim=0)
 
         alpha, gate_logits = self.gate(image_feats)
         gate_weight = (1 - alpha).unsqueeze(-1)
@@ -231,6 +288,7 @@ class CSDGModel(nn.Module):
             'gate_logits': gate_logits,
             'content_features': content_features,
             'style_features': style_features,
+            'style_features_batch': style_features_batch,
             'image_features': image_feats,
             'zeroshot_features': zeroshot_features,
             'zeroshot_logits': zeroshot_logits
@@ -289,8 +347,10 @@ class CSDG(TrainerX):
 
         decor_weight = self.cfg.TRAINER.CSDG.LOSS.STYLE_DECORR_WEIGHT
         if decor_weight > 0:
-            content_centered = outputs['content_features'] - outputs['content_features'].mean(dim=0, keepdim=True)
-            style_centered = outputs['style_features'] - outputs['style_features'].mean(dim=0, keepdim=True)
+            content_feat = outputs['content_features']
+            style_batch = outputs['style_features_batch'].mean(dim=0)
+            content_centered = content_feat - content_feat.mean(dim=0, keepdim=True)
+            style_centered = style_batch - style_batch.mean(dim=0, keepdim=True)
             denom = max(content_centered.size(0) - 1, 1)
             cross_cov = content_centered.t() @ style_centered / denom
             decor_loss = cross_cov.pow(2).mean()
