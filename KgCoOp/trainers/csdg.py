@@ -152,7 +152,9 @@ class GateModule(nn.Module):
             self.mlp[-1].bias.fill_(init_bias)
 
     def forward(self, image_feats):
-        gate_logit = self.mlp(image_feats)
+        # Align feature dtype with the gate's parameters to avoid fp16/fp32 mismatches
+        mlp_dtype = self.mlp[0].weight.dtype
+        gate_logit = self.mlp(image_feats.to(mlp_dtype))
         alpha = torch.sigmoid(gate_logit / self.temperature)
         return alpha.squeeze(-1), gate_logit.squeeze(-1)
 
