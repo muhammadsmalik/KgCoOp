@@ -151,6 +151,13 @@ class StylePromptLearner(BasePromptLearner):
 
         max_domain = self.domain_embed.num_embeddings
         if domain_ids.max().item() >= max_domain:
+            if not hasattr(self, "_domain_overflow_warned"):
+                max_seen = domain_ids.max().item()
+                print(
+                    f"[CSDG] domain id {max_seen} exceeds trained source range (0-{max_domain - 1}); "
+                    "falling back to shared style prompts."
+                )
+                self._domain_overflow_warned = True
             if self.dropout is not None:
                 shared_prompts = self.dropout(shared_prompts)
             return {
