@@ -1,4 +1,15 @@
-"""CSDG trainer scaffold rebuilt with maximal reuse of KgCoOp/CoCoOp components."""
+"""Content-Style Dual-stream Gated (CSDG) trainer.
+
+This module intentionally reuses as much of the KgCoOp/CoCoOp codebase as possible:
+
+* Content prompts reuse KgCoOp's ``PromptLearner`` (semantic anchoring, templates).
+* Style prompts subclass CoCoOp's learner to inherit prompt construction and token
+  handling while adding a light domain-conditioning wrapper.
+* CLIP loading/text encoding are borrowed from KgCoOp helpers.
+* The gate mirrors CoCoOp's meta-network geometry but outputs a scalar weight.
+
+Only the fusion logic, auxiliary losses, and domain-aware biasing are new.
+"""
 
 from collections import OrderedDict
 from typing import Optional, Tuple
@@ -22,7 +33,7 @@ from .cocoop import PromptLearner as CoCoOpPromptLearner
 
 
 def _adapt_prompt_cfg(cfg: CfgNode, prompt_node: CfgNode) -> CfgNode:
-    """Clone the main cfg and map CSDG prompt settings onto COOP defaults."""
+    """Clone the master config and project CSDG prompt settings onto COOP/CoCoOp nodes."""
 
     cfg_copy = cfg.clone()
     cfg_copy.defrost()
@@ -43,7 +54,7 @@ def _adapt_prompt_cfg(cfg: CfgNode, prompt_node: CfgNode) -> CfgNode:
 
 
 class ContentPromptLearner(KgCoOpPromptLearner):
-    """Content stream prompt learner that keeps KgCoOp behaviour."""
+    """Content stream prompt learner that preserves KgCoOp behaviour."""
 
     def __init__(self, cfg: CfgNode, cfg_node: CfgNode, classnames, clip_model):
         prompt_cfg = _adapt_prompt_cfg(cfg, cfg_node)
@@ -61,7 +72,7 @@ class CSDGTextEncoder(KgCoOpTextEncoder):
 
 
 class StylePromptLearner(CoCoOpPromptLearner):
-    """Style stream prompt learner reusing CoCoOp construction helpers."""
+    """Style stream prompt learner reusing CoCoOp prompt construction."""
 
     def __init__(self, cfg: CfgNode, cfg_node: CfgNode, classnames, clip_model):
         prompt_cfg = _adapt_prompt_cfg(cfg, cfg_node)
@@ -97,6 +108,7 @@ class StylePromptLearner(CoCoOpPromptLearner):
         return prompts
 
     def forward(self, domain_ids: Optional[torch.Tensor] = None) -> dict:
+        """Return shared prompts plus optional domain-conditioned variants."""
         if self.domain_embed is None or domain_ids is None:
             shared = self._base_prompts()
             return {
@@ -160,7 +172,7 @@ class StylePromptLearner(CoCoOpPromptLearner):
 
 
 class GateModule(nn.Module):
-    """Scalar gate reusing CoCoOp meta-net dimensions."""
+    """Scalar gate module mirroring CoCoOp's meta-net dimensions."""
 
     def __init__(self, cfg: CfgNode, clip_model):
         super().__init__()
@@ -181,6 +193,7 @@ class GateModule(nn.Module):
             self.mlp[-1].bias.fill_(init_bias)
 
     def forward(self, image_feats: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Compute gate activations (sigmoid) and raw logits."""
         dtype = self.mlp[0].weight.dtype
         logits = self.mlp(image_feats.to(dtype)).squeeze(-1)
         alpha = torch.sigmoid(logits / self.temperature)
@@ -188,7 +201,7 @@ class GateModule(nn.Module):
 
 
 class CSDGModel(nn.Module):
-    """Dual-stream model wiring reused prompt learners and gate."""
+    """Dual-stream CLIP head that fuses content/style streams via a learned gate."""
 
     def __init__(self, cfg: CfgNode, classnames, clip_model):
         super().__init__()
@@ -210,10 +223,12 @@ class CSDGModel(nn.Module):
         self.gate = GateModule(cfg, clip_model)
 
     def encode_text(self, prompts: torch.Tensor) -> torch.Tensor:
+        """Encode prompts through the shared text encoder with normalization."""
         feats = self.text_encoder(prompts, self.tokenized_prompts)
         return F.normalize(feats, dim=-1)
 
     def forward(self, images: torch.Tensor, domain_ids: Optional[torch.Tensor] = None) -> dict:
+        """Run the dual-stream forward pass and expose diagnostics for losses."""
         images = images.type(self.dtype)
         image_feats = self.image_encoder(images)
         image_feats = F.normalize(image_feats, dim=-1)
@@ -283,14 +298,16 @@ class CSDGModel(nn.Module):
 
 @TRAINER_REGISTRY.register()
 class CSDG(TrainerX):
-    """Trainer wiring CSDG model into Dassl workflow."""
+    """Trainer wiring the CSDG model into Dassl's standard workflow."""
 
     def check_cfg(self, cfg):
+        """Validate supported precision/fusion knobs."""
         assert cfg.TRAINER.CSDG.PREC in ["fp16", "fp32", "amp"]
         if cfg.TRAINER.CSDG.LOSS.FUSE_MODE != "sigmoid":
             raise ValueError(f"Unsupported fuse mode: {cfg.TRAINER.CSDG.LOSS.FUSE_MODE}")
 
     def build_model(self):
+        """Construct the model/optimizer by leaning on KgCoOp helpers."""
         cfg = self.cfg
         classnames = self.dm.dataset.classnames
 
@@ -315,6 +332,7 @@ class CSDG(TrainerX):
         self.register_model("csdg", self.model, self.optim, self.sched)
 
     def forward_backward(self, batch):
+        """Compute losses, apply gradients, and log diagnostics."""
         images = batch["img"].to(self.device)
         labels = batch["label"].to(self.device)
         domain = batch.get("domain")
@@ -391,8 +409,10 @@ class CSDG(TrainerX):
         return loss_summary
 
     def parse_batch_train(self, batch):
+        """Return the tuple expected by TrainerX (image, label, domain)."""
         return batch["img"], batch["label"], batch.get("domain")
 
     def model_inference(self, images):
+        """Inference uses the fused logits (content + gated style)."""
         outputs = self.model(images)
         return outputs["logits"]
