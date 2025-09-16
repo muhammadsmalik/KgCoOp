@@ -184,3 +184,97 @@ class GateModule(nn.Module):
         logits = self.mlp(image_feats.to(dtype)).squeeze(-1)
         alpha = torch.sigmoid(logits / self.temperature)
         return alpha, logits
+
+
+class CSDGModel(nn.Module):
+    """Dual-stream model wiring reused prompt learners and gate."""
+
+    def __init__(self, cfg: CfgNode, classnames, clip_model):
+        super().__init__()
+        self.cfg = cfg
+
+        self.image_encoder = clip_model.visual
+        self.text_encoder = CSDGTextEncoder(clip_model)
+        self.logit_scale = clip_model.logit_scale
+        self.dtype = clip_model.dtype
+
+        self.content_prompt = ContentPromptLearner(
+            cfg, cfg.TRAINER.CSDG.CONTENT, classnames, clip_model
+        )
+        self.style_prompt = StylePromptLearner(
+            cfg, cfg.TRAINER.CSDG.STYLE, classnames, clip_model
+        )
+        self.tokenized_prompts = self.content_prompt.tokenized_prompts
+
+        self.gate = GateModule(cfg, clip_model)
+
+    def encode_text(self, prompts: torch.Tensor) -> torch.Tensor:
+        feats = self.text_encoder(prompts, self.tokenized_prompts)
+        return F.normalize(feats, dim=-1)
+
+    def forward(self, images: torch.Tensor, domain_ids: Optional[torch.Tensor] = None) -> dict:
+        images = images.type(self.dtype)
+        image_feats = self.image_encoder(images)
+        image_feats = F.normalize(image_feats, dim=-1)
+
+        # Content stream
+        content_prompts = self.content_prompt()
+        content_features = self.encode_text(content_prompts)
+        content_logits = self.logit_scale.exp() * image_feats @ content_features.t()
+
+        # Style stream
+        style_out = self.style_prompt(domain_ids)
+        if style_out["per_domain_prompts"] is None:
+            style_prompts = style_out["shared_prompts"]
+            style_features = self.encode_text(style_prompts)
+            style_logits = self.logit_scale.exp() * image_feats @ style_features.t()
+            style_features_batch = style_features.unsqueeze(0).expand(image_feats.size(0), -1, -1)
+        else:
+            per_domain_prompts = style_out["per_domain_prompts"]
+            domain_indices = style_out["domain_indices"]
+            domain_feats = []
+            for prompts in per_domain_prompts:
+                feats = self.encode_text(prompts)
+                domain_feats.append(feats)
+            domain_feats = torch.stack(domain_feats)
+
+            logits_per_sample = []
+            feats_per_sample = []
+            logit_scale = self.logit_scale.exp()
+            for idx, dom_idx in enumerate(domain_indices):
+                feats = domain_feats[dom_idx]
+                logits_i = logit_scale * image_feats[idx] @ feats.t()
+                logits_per_sample.append(logits_i)
+                feats_per_sample.append(feats)
+
+            style_logits = torch.stack(logits_per_sample)
+            style_features_batch = torch.stack(feats_per_sample)
+            style_features = style_features_batch.mean(dim=0)
+
+        alpha, gate_logits = self.gate(image_feats)
+        gate_weight = (1 - alpha).unsqueeze(-1)
+        style_logits_for_fusion = style_logits
+        if self.cfg.TRAINER.CSDG.GATE.DETACH_STYLE_GRAD:
+            style_logits_for_fusion = style_logits_for_fusion.detach()
+        fused_logits = content_logits + gate_weight * style_logits_for_fusion
+
+        zeroshot_features = self.content_prompt.zeroshot_features
+        zeroshot_logits = self.logit_scale.exp() * image_feats @ zeroshot_features.t()
+
+        content_expanded = content_features.unsqueeze(0)
+        style_content_sim = (style_features_batch * content_expanded).sum(dim=-1)
+
+        return {
+            "logits": fused_logits,
+            "content_logits": content_logits,
+            "style_logits": style_logits,
+            "alpha": alpha,
+            "gate_logits": gate_logits,
+            "content_features": content_features,
+            "style_features": style_features,
+            "style_features_batch": style_features_batch,
+            "style_content_sim": style_content_sim,
+            "image_features": image_feats,
+            "zeroshot_features": zeroshot_features,
+            "zeroshot_logits": zeroshot_logits,
+        }
