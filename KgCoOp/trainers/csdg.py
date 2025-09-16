@@ -1,5 +1,6 @@
 """CSDG trainer scaffold rebuilt with maximal reuse of KgCoOp/CoCoOp components."""
 
+from collections import OrderedDict
 from typing import Optional, Tuple
 
 import torch
@@ -278,3 +279,120 @@ class CSDGModel(nn.Module):
             "zeroshot_features": zeroshot_features,
             "zeroshot_logits": zeroshot_logits,
         }
+
+
+@TRAINER_REGISTRY.register()
+class CSDG(TrainerX):
+    """Trainer wiring CSDG model into Dassl workflow."""
+
+    def check_cfg(self, cfg):
+        assert cfg.TRAINER.CSDG.PREC in ["fp16", "fp32", "amp"]
+        if cfg.TRAINER.CSDG.LOSS.FUSE_MODE != "sigmoid":
+            raise ValueError(f"Unsupported fuse mode: {cfg.TRAINER.CSDG.LOSS.FUSE_MODE}")
+
+    def build_model(self):
+        cfg = self.cfg
+        classnames = self.dm.dataset.classnames
+
+        print(f"Loading CLIP (backbone: {cfg.MODEL.BACKBONE.NAME})")
+        clip_model = load_clip_to_cpu(cfg)
+        if cfg.TRAINER.CSDG.PREC in ["fp32", "amp"]:
+            clip_model.float()
+
+        print("Building CSDG model")
+        self.model = CSDGModel(cfg, classnames, clip_model)
+
+        print("Freezing CLIP backbone/text encoders")
+        for name, param in self.model.named_parameters():
+            if name.startswith("image_encoder") or name.startswith("text_encoder"):
+                param.requires_grad_(False)
+
+        self.model.to(self.device)
+
+        params = [p for p in self.model.parameters() if p.requires_grad]
+        self.optim = build_optimizer(params, cfg.OPTIM)
+        self.sched = build_lr_scheduler(self.optim, cfg.OPTIM)
+        self.register_model("csdg", self.model, self.optim, self.sched)
+
+    def forward_backward(self, batch):
+        images = batch["img"].to(self.device)
+        labels = batch["label"].to(self.device)
+        domain = batch.get("domain")
+        if domain is not None:
+            domain = domain.to(self.device)
+
+        outputs = self.model(images, domain)
+        logits = outputs["logits"]
+
+        losses = OrderedDict()
+        ce_loss = F.cross_entropy(logits, labels)
+        losses["ce"] = ce_loss
+
+        anchor_weight = self.cfg.TRAINER.CSDG.CONTENT.ANCHOR_WEIGHT
+        if anchor_weight > 0:
+            content_feat = outputs["content_features"]
+            zeroshot_feat = outputs["zeroshot_features"]
+            anchor_loss = 1 - (content_feat * zeroshot_feat).sum(dim=-1).mean()
+            losses["anchor"] = anchor_weight * anchor_loss
+
+        decor_weight = self.cfg.TRAINER.CSDG.LOSS.STYLE_DECORR_WEIGHT
+        if decor_weight > 0:
+            style_cos = outputs["style_content_sim"]
+            decor_loss = style_cos.pow(2).mean()
+            losses["decor"] = decor_weight * decor_loss
+
+        gate_ent_weight = self.cfg.TRAINER.CSDG.LOSS.GATE_ENT_WEIGHT
+        if gate_ent_weight > 0:
+            alpha = outputs["alpha"].clamp(1e-6, 1 - 1e-6)
+            entropy = -(alpha * alpha.log() + (1 - alpha) * (1 - alpha).log()).mean()
+            gate_loss = -entropy
+            losses["gate"] = gate_ent_weight * gate_loss
+
+        style_ce_weight = self.cfg.TRAINER.CSDG.LOSS.STYLE_CE_WEIGHT
+        if style_ce_weight > 0:
+            style_ce = F.cross_entropy(outputs["style_logits"], labels)
+            losses["style_ce"] = style_ce_weight * style_ce
+
+        zs_kl_weight = self.cfg.TRAINER.CSDG.LOSS.ZERO_SHOT_KL_WEIGHT
+        if zs_kl_weight > 0:
+            teacher = F.softmax(outputs["zeroshot_logits"].detach(), dim=1)
+            student_log = F.log_softmax(logits, dim=1)
+            kl = F.kl_div(student_log, teacher, reduction="batchmean")
+            losses["zero_shot_kl"] = zs_kl_weight * kl
+
+        total_loss = sum(losses.values())
+        self.model_backward_and_update(total_loss, names="csdg")
+
+        with torch.no_grad():
+            alpha = outputs["alpha"]
+            loss_summary = {
+                "loss": total_loss.item(),
+                "loss_ce": ce_loss.item(),
+                "acc": compute_accuracy(logits, labels)[0].item(),
+                "alpha_mean": alpha.mean().item(),
+                "alpha_std": alpha.std(unbiased=False).item(),
+            }
+
+            if anchor_weight > 0:
+                loss_summary["loss_anchor"] = (anchor_loss * anchor_weight).item()
+            if decor_weight > 0:
+                loss_summary["loss_decor"] = (decor_loss * decor_weight).item()
+            if gate_ent_weight > 0:
+                loss_summary["loss_gate"] = (gate_loss * gate_ent_weight).item()
+                loss_summary["gate_entropy"] = entropy.item()
+            if style_ce_weight > 0:
+                loss_summary["loss_style_ce"] = (style_ce * style_ce_weight).item()
+            if zs_kl_weight > 0:
+                loss_summary["loss_zero_shot_kl"] = (kl * zs_kl_weight).item()
+
+        if (self.batch_idx + 1) == self.num_batches:
+            self.sched.step()
+
+        return loss_summary
+
+    def parse_batch_train(self, batch):
+        return batch["img"], batch["label"], batch.get("domain")
+
+    def model_inference(self, images):
+        outputs = self.model(images)
+        return outputs["logits"]
