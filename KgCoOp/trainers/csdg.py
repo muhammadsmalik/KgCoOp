@@ -13,7 +13,7 @@ from dassl.optim import build_optimizer, build_lr_scheduler
 from clip import clip
 
 from .kgcoop import PromptLearner as KgCoOpPromptLearner
-from .coop import PromptLearner as CoOpPromptLearner
+from .cocoop import PromptLearner as CoCoOpPromptLearner
 
 
 def load_clip_to_cpu(cfg):
@@ -57,6 +57,10 @@ def _build_prompt_cfg(cfg, cfg_node):
     coop_cfg.CTX_INIT = cfg_node.CTX_INIT
     coop_cfg.CSC = getattr(cfg_node, 'CSC', False)
     coop_cfg.PREC = cfg.TRAINER.CSDG.PREC
+    cocoop_cfg = cfg_adapter.TRAINER.COCOOP
+    cocoop_cfg.N_CTX = cfg_node.N_CTX
+    cocoop_cfg.CTX_INIT = cfg_node.CTX_INIT
+    cocoop_cfg.PREC = cfg.TRAINER.CSDG.PREC
     cfg_adapter.freeze()
     return cfg_adapter
 
@@ -69,10 +73,12 @@ class ContentPromptLearner(KgCoOpPromptLearner):
         self.register_buffer('zeroshot_features', zeroshot.to(dtype=clip_model.dtype))
 
 
-class StylePromptLearner(CoOpPromptLearner):
+class StylePromptLearner(CoCoOpPromptLearner):
     def __init__(self, cfg, cfg_node, classnames, clip_model):
         prompt_cfg = _build_prompt_cfg(cfg, cfg_node)
         super().__init__(prompt_cfg, classnames, clip_model)
+        # CoCoOp's meta-net is unnecessary for domain-conditioned prompts
+        self.meta_net = None
         dropout = getattr(cfg_node, 'DROPOUT', 0.0)
         self.dropout_layer = nn.Dropout(dropout) if dropout > 0 else None
         self.domain_embed = None
