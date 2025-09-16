@@ -51,6 +51,7 @@ CUSTOM_TEMPLATES = {
     "ImageNetV2": "a photo of a {}.",
     "ImageNetA": "a photo of a {}.",
     "ImageNetR": "a photo of a {}.",
+    "OfficeHomeDG": "a photo of a {}.",
 }
 
 
