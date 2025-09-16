@@ -172,7 +172,7 @@ class StylePromptLearner(CoCoOpPromptLearner):
 
 
 class GateModule(nn.Module):
-    """Scalar gate module mirroring CoCoOp's meta-net dimensions."""
+    """Two-way gate that yields content/style mixing weights via softmax."""
 
     def __init__(self, cfg: CfgNode, clip_model):
         super().__init__()
@@ -183,21 +183,23 @@ class GateModule(nn.Module):
         layers = [nn.Linear(vis_dim, hidden_dim), nn.ReLU(inplace=True)]
         if cfg.TRAINER.CSDG.GATE.DROPOUT > 0:
             layers.insert(1, nn.Dropout(cfg.TRAINER.CSDG.GATE.DROPOUT))
-        layers.append(nn.Linear(hidden_dim, 1))
+        layers.append(nn.Linear(hidden_dim, 2))
         self.mlp = nn.Sequential(*layers)
 
         self.temperature = cfg.TRAINER.CSDG.GATE.SIGMOID_TEMPERATURE
 
         init_bias = cfg.TRAINER.CSDG.GATE.INIT_BIAS
         with torch.no_grad():
-            self.mlp[-1].bias.fill_(init_bias)
+            self.mlp[-1].bias.zero_()
+            self.mlp[-1].bias[0] = init_bias
+            self.mlp[-1].bias[1] = -init_bias
 
     def forward(self, image_feats: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Compute gate activations (sigmoid) and raw logits."""
+        """Return softmax weights (content, style) and raw logits."""
         dtype = self.mlp[0].weight.dtype
-        logits = self.mlp(image_feats.to(dtype)).squeeze(-1)
-        alpha = torch.sigmoid(logits / self.temperature)
-        return alpha, logits
+        logits = self.mlp(image_feats.to(dtype))
+        weights = F.softmax(logits / self.temperature, dim=-1)
+        return weights, logits
 
 
 class CSDGModel(nn.Module):
@@ -267,12 +269,13 @@ class CSDGModel(nn.Module):
             style_features_batch = torch.stack(feats_per_sample)
             style_features = style_features_batch.mean(dim=0)
 
-        alpha, gate_logits = self.gate(image_feats)
-        gate_weight = (1 - alpha).unsqueeze(-1)
+        gate_weights, gate_logits = self.gate(image_feats)
+        content_weight = gate_weights[:, 0].unsqueeze(-1)
+        style_weight = gate_weights[:, 1].unsqueeze(-1)
         style_logits_for_fusion = style_logits
         if self.cfg.TRAINER.CSDG.GATE.DETACH_STYLE_GRAD:
             style_logits_for_fusion = style_logits_for_fusion.detach()
-        fused_logits = content_logits + gate_weight * style_logits_for_fusion
+        fused_logits = content_weight * content_logits + style_weight * style_logits_for_fusion
 
         zeroshot_features = self.content_prompt.zeroshot_features
         zeroshot_logits = self.logit_scale.exp() * image_feats @ zeroshot_features.t()
@@ -284,8 +287,9 @@ class CSDGModel(nn.Module):
             "logits": fused_logits,
             "content_logits": content_logits,
             "style_logits": style_logits,
-            "alpha": alpha,
+            "alpha": style_weight.squeeze(-1),
             "gate_logits": gate_logits,
+            "gate_weights": gate_weights,
             "content_features": content_features,
             "style_features": style_features,
             "style_features_batch": style_features_batch,
@@ -361,8 +365,8 @@ class CSDG(TrainerX):
 
         gate_ent_weight = self.cfg.TRAINER.CSDG.LOSS.GATE_ENT_WEIGHT
         if gate_ent_weight > 0:
-            alpha = outputs["alpha"].clamp(1e-6, 1 - 1e-6)
-            entropy = -(alpha * alpha.log() + (1 - alpha) * (1 - alpha).log()).mean()
+            gate_weights = outputs["gate_weights"].clamp_min(1e-6)
+            entropy = -(gate_weights * gate_weights.log()).sum(dim=1).mean()
             gate_loss = -entropy
             losses["gate"] = gate_ent_weight * gate_loss
 
