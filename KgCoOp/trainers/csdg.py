@@ -280,6 +280,9 @@ class CSDGModel(nn.Module):
         zeroshot_features = self.content_prompt.zeroshot_features
         zeroshot_logits = self.logit_scale.exp() * image_feats @ zeroshot_features.t()
 
+        content_expanded = content_features.unsqueeze(0)
+        style_content_sim = (style_features_batch * content_expanded).sum(dim=-1)
+
         return {
             'logits': fused_logits,
             'content_logits': content_logits,
@@ -289,6 +292,7 @@ class CSDGModel(nn.Module):
             'content_features': content_features,
             'style_features': style_features,
             'style_features_batch': style_features_batch,
+            'style_content_sim': style_content_sim,
             'image_features': image_feats,
             'zeroshot_features': zeroshot_features,
             'zeroshot_logits': zeroshot_logits
@@ -347,16 +351,8 @@ class CSDG(TrainerX):
 
         decor_weight = self.cfg.TRAINER.CSDG.LOSS.STYLE_DECORR_WEIGHT
         if decor_weight > 0:
-            content_feat = outputs['content_features']
-            content_centered = content_feat - content_feat.mean(dim=0, keepdim=True)
-            denom = max(content_centered.size(0) - 1, 1)
-            style_batch = outputs['style_features_batch']
-            style_centered = style_batch - style_batch.mean(dim=1, keepdim=True)
-            cov_terms = []
-            for style_sample in style_centered:
-                cross_cov = content_centered.t() @ style_sample / denom
-                cov_terms.append(cross_cov.pow(2).mean())
-            decor_loss = torch.stack(cov_terms).mean()
+            style_cos = outputs['style_content_sim']
+            decor_loss = style_cos.pow(2).mean()
             losses['decor'] = decor_weight * decor_loss
 
         gate_ent_weight = self.cfg.TRAINER.CSDG.LOSS.GATE_ENT_WEIGHT
