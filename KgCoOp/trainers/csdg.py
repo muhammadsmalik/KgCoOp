@@ -1,6 +1,6 @@
-import os.path as osp
+import copy
 from collections import OrderedDict
-from typing import Dict, Optional
+from typing import Optional
 
 import torch
 import torch.nn as nn
@@ -11,11 +11,9 @@ from dassl.metrics import compute_accuracy
 from dassl.optim import build_optimizer, build_lr_scheduler
 
 from clip import clip
-from clip.simple_tokenizer import SimpleTokenizer as _Tokenizer
 
-from .kgcoop import CUSTOM_TEMPLATES as KGCOOP_TEMPLATES
-
-_tokenizer = _Tokenizer()
+from .kgcoop import PromptLearner as KgCoOpPromptLearner
+from .coop import PromptLearner as CoOpPromptLearner
 
 
 def load_clip_to_cpu(cfg):
@@ -51,96 +49,48 @@ class TextEncoder(nn.Module):
         x = x[torch.arange(x.shape[0]), tokenized_prompts.argmax(dim=-1)] @ self.text_projection
         return x
 
+def _build_prompt_cfg(cfg, cfg_node):
+    cfg_adapter = copy.deepcopy(cfg)
+    coop_cfg = cfg_adapter.TRAINER.COOP
+    coop_cfg.N_CTX = cfg_node.N_CTX
+    coop_cfg.CTX_INIT = cfg_node.CTX_INIT
+    coop_cfg.CSC = getattr(cfg_node, 'CSC', False)
+    coop_cfg.PREC = cfg.TRAINER.CSDG.PREC
+    return cfg_adapter
 
-class BasePromptLearner(nn.Module):
-    """Reusable prompt learner logic based on KgCoOp with config hooks."""
 
+class ContentPromptLearner(nn.Module):
     def __init__(self, cfg, cfg_node, classnames, clip_model):
         super().__init__()
-        self.cfg = cfg
-        self.cfg_node = cfg_node
-        n_cls = len(classnames)
-        n_ctx = cfg_node.N_CTX
-        ctx_init = cfg_node.CTX_INIT
-        dtype = clip_model.dtype
-        ctx_dim = clip_model.ln_final.weight.shape[0]
-        clip_imsize = clip_model.visual.input_resolution
-        cfg_imsize = cfg.INPUT.SIZE[0]
-        assert cfg_imsize == clip_imsize, f"cfg_imsize ({cfg_imsize}) must equal to clip_imsize ({clip_imsize})"
-
-        if ctx_init:
-            template = getattr(cfg_node, 'TEMPLATE', 'a photo of a')
-            template = template.replace('_', ' ')
-            n_ctx = len(template.split(' '))
-            prompt = clip.tokenize(template)
-            with torch.no_grad():
-                embedding = clip_model.token_embedding(prompt).type(dtype)
-            ctx_vectors = embedding[0, 1 : 1 + n_ctx, :]
-            prompt_prefix = template
-        else:
-            if getattr(cfg_node, 'CSC', False):
-                ctx_vectors = torch.empty(n_cls, n_ctx, ctx_dim, dtype=dtype)
-            else:
-                ctx_vectors = torch.empty(n_ctx, ctx_dim, dtype=dtype)
-            nn.init.normal_(ctx_vectors, std=0.02)
-            prompt_prefix = ' '.join(['X'] * n_ctx)
-
-        print(f"{self.__class__.__name__} init prefix: '{prompt_prefix}' (tokens={n_ctx})")
-        self.ctx = nn.Parameter(ctx_vectors)
-
-        classnames = [name.replace('_', ' ') for name in classnames]
-        prompts = [prompt_prefix + ' ' + name + '.' for name in classnames]
-        tokenized_prompts = torch.cat([clip.tokenize(p) for p in prompts])
-        with torch.no_grad():
-            embedding = clip_model.token_embedding(tokenized_prompts).type(dtype)
-        self.register_buffer('token_prefix', embedding[:, :1, :])
-        self.register_buffer('token_suffix', embedding[:, 1 + n_ctx :, :])
-
-        self.n_cls = n_cls
-        self.n_ctx = n_ctx
-        self.tokenized_prompts = tokenized_prompts
+        prompt_cfg = _build_prompt_cfg(cfg, cfg_node)
+        self.prompt = KgCoOpPromptLearner(prompt_cfg, classnames, clip_model)
+        self.tokenized_prompts = self.prompt.tokenized_prompts
+        zeroshot = self.prompt.text_features.detach().clone()
+        self.register_buffer('zeroshot_features', zeroshot.to(dtype=clip_model.dtype))
 
     def forward(self):
-        ctx = self.ctx
-        if ctx.dim() == 2:
-            ctx = ctx.unsqueeze(0).expand(self.n_cls, -1, -1)
-        prompts = torch.cat([self.token_prefix, ctx, self.token_suffix], dim=1)
-        return prompts
+        return self.prompt()
 
 
-class ContentPromptLearner(BasePromptLearner):
+class StylePromptLearner(nn.Module):
     def __init__(self, cfg, cfg_node, classnames, clip_model):
-        super().__init__(cfg, cfg_node, classnames, clip_model)
-
-        template_key = cfg.DATASET.NAME
-        anchor_template = KGCOOP_TEMPLATES.get(template_key, 'a photo of a {}.')
-        classnames_clean = [name.replace('_', ' ') for name in classnames]
-        prompts = [anchor_template.format(name) for name in classnames_clean]
-        tokenized = torch.cat([clip.tokenize(p) for p in prompts])
-        device = clip_model.token_embedding.weight.device
-        with torch.no_grad():
-            tokenized = tokenized.to(device)
-            text_features = clip_model.encode_text(tokenized)
-            text_features = text_features / text_features.norm(dim=-1, keepdim=True)
-        self.register_buffer('zeroshot_features', text_features.type(clip_model.dtype))
-
-
-class StylePromptLearner(BasePromptLearner):
-    def __init__(self, cfg, cfg_node, classnames, clip_model):
-        super().__init__(cfg, cfg_node, classnames, clip_model)
+        super().__init__()
+        prompt_cfg = _build_prompt_cfg(cfg, cfg_node)
+        self.prompt = CoOpPromptLearner(prompt_cfg, classnames, clip_model)
+        self.tokenized_prompts = self.prompt.tokenized_prompts
         dropout = getattr(cfg_node, 'DROPOUT', 0.0)
         self.dropout = nn.Dropout(dropout) if dropout > 0 else None
         self.domain_embed = None
+        self._domain_debug_printed = False
         if getattr(cfg_node, 'USE_DOMAIN_ID', False):
             emb_dim = cfg_node.DOMAIN_EMB_DIM
             num_domains = len(cfg.DATASET.SOURCE_DOMAINS)
             self.domain_embed = nn.Embedding(num_domains, emb_dim)
-            ctx_dim = self.ctx.shape[-1]
-            self.domain_proj = nn.Linear(emb_dim, self.n_ctx * ctx_dim)
-        self._domain_debug_printed = False
+            ctx_dim = self.prompt.ctx.shape[-1]
+            self.domain_proj = nn.Linear(emb_dim, self.prompt.n_ctx * ctx_dim)
 
     def forward(self, domain_ids: Optional[torch.Tensor] = None):
-        shared_prompts = super().forward()
+        shared_prompts = self.prompt()
         if self.domain_embed is None or domain_ids is None:
             if self.dropout is not None:
                 shared_prompts = self.dropout(shared_prompts)
@@ -152,7 +102,7 @@ class StylePromptLearner(BasePromptLearner):
 
         max_domain = self.domain_embed.num_embeddings
         if domain_ids.max().item() >= max_domain:
-            if not hasattr(self, "_domain_overflow_warned"):
+            if not hasattr(self, '_domain_overflow_warned'):
                 max_seen = domain_ids.max().item()
                 print(
                     f"[CSDG] domain id {max_seen} exceeds trained source range (0-{max_domain - 1}); "
@@ -174,18 +124,22 @@ class StylePromptLearner(BasePromptLearner):
             print(f"[CSDG] unique domain ids in batch: {unique_domains.tolist()}")
             self._domain_debug_printed = True
 
-        per_domain_prompts = []
-        ctx = self.ctx
+        ctx = self.prompt.ctx
         if ctx.dim() == 2:
-            ctx = ctx.unsqueeze(0).expand(self.n_cls, -1, -1)
+            ctx = ctx.unsqueeze(0).expand(self.prompt.n_cls, -1, -1)
 
+        per_domain_prompts = []
         for dom_id in unique_domains:
             emb = self.domain_embed(dom_id)
-            bias = self.domain_proj(emb).to(self.ctx.dtype)
-            bias = bias.view(self.n_ctx, -1)
+            bias = self.domain_proj(emb).to(ctx.dtype)
+            bias = bias.view(self.prompt.n_ctx, -1)
             ctx_shifted = ctx + bias.unsqueeze(0)
-            prompts = torch.cat([self.token_prefix, ctx_shifted, self.token_suffix], dim=1)
-            per_domain_prompts.append(prompts)
+            prompts_dom = self.prompt.construct_prompts(
+                ctx_shifted,
+                self.prompt.token_prefix,
+                self.prompt.token_suffix
+            )
+            per_domain_prompts.append(prompts_dom)
 
         per_domain_prompts = torch.stack(per_domain_prompts)
         if self.dropout is not None:
