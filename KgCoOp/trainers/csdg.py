@@ -348,12 +348,15 @@ class CSDG(TrainerX):
         decor_weight = self.cfg.TRAINER.CSDG.LOSS.STYLE_DECORR_WEIGHT
         if decor_weight > 0:
             content_feat = outputs['content_features']
-            style_batch = outputs['style_features_batch'].mean(dim=0)
             content_centered = content_feat - content_feat.mean(dim=0, keepdim=True)
-            style_centered = style_batch - style_batch.mean(dim=0, keepdim=True)
             denom = max(content_centered.size(0) - 1, 1)
-            cross_cov = content_centered.t() @ style_centered / denom
-            decor_loss = cross_cov.pow(2).mean()
+            style_batch = outputs['style_features_batch']
+            style_centered = style_batch - style_batch.mean(dim=1, keepdim=True)
+            cov_terms = []
+            for style_sample in style_centered:
+                cross_cov = content_centered.t() @ style_sample / denom
+                cov_terms.append(cross_cov.pow(2).mean())
+            decor_loss = torch.stack(cov_terms).mean()
             losses['decor'] = decor_weight * decor_loss
 
         gate_ent_weight = self.cfg.TRAINER.CSDG.LOSS.GATE_ENT_WEIGHT
