@@ -50,12 +50,14 @@ class TextEncoder(nn.Module):
         return x
 
 def _build_prompt_cfg(cfg, cfg_node):
-    cfg_adapter = copy.deepcopy(cfg)
+    cfg_adapter = cfg.clone()
+    cfg_adapter.defrost()
     coop_cfg = cfg_adapter.TRAINER.COOP
     coop_cfg.N_CTX = cfg_node.N_CTX
     coop_cfg.CTX_INIT = cfg_node.CTX_INIT
     coop_cfg.CSC = getattr(cfg_node, 'CSC', False)
     coop_cfg.PREC = cfg.TRAINER.CSDG.PREC
+    cfg_adapter.freeze()
     return cfg_adapter
 
 
