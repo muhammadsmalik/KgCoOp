@@ -170,7 +170,7 @@ class StylePromptLearner(BasePromptLearner):
 
         for dom_id in unique_domains:
             emb = self.domain_embed(dom_id)
-            bias = self.domain_proj(emb)
+            bias = self.domain_proj(emb).to(self.ctx.dtype)
             bias = bias.view(self.n_ctx, -1)
             ctx_shifted = ctx + bias.unsqueeze(0)
             prompts = torch.cat([self.token_prefix, ctx_shifted, self.token_suffix], dim=1)
