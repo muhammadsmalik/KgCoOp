@@ -30,6 +30,7 @@ import trainers.cocoop
 import trainers.zsclip
 import trainers.prograd
 import trainers.kgcoop
+import trainers.csdg
 def print_args(args, cfg):
     print("***************")
     print("** Arguments **")
@@ -102,6 +103,38 @@ def extend_cfg(cfg):
     cfg.TRAINER.COCOOP.N_CTX = 16  # number of context vectors
     cfg.TRAINER.COCOOP.CTX_INIT = False  # initialization words
     cfg.TRAINER.COCOOP.PREC = "fp16"  # fp16, fp32, amp
+
+    cfg.TRAINER.CSDG = CN()
+    cfg.TRAINER.CSDG.PREC = "fp16"  # fp16, fp32, amp
+    cfg.TRAINER.CSDG.CONTENT = CN()
+    cfg.TRAINER.CSDG.CONTENT.N_CTX = 16
+    cfg.TRAINER.CSDG.CONTENT.CTX_INIT = True
+    cfg.TRAINER.CSDG.CONTENT.CSC = False
+    cfg.TRAINER.CSDG.CONTENT.ANCHOR_WEIGHT = 1.0
+    cfg.TRAINER.CSDG.CONTENT.FREEZE_PROMPT_LR_MULT = 1.0
+
+    cfg.TRAINER.CSDG.STYLE = CN()
+    cfg.TRAINER.CSDG.STYLE.N_CTX = 16
+    cfg.TRAINER.CSDG.STYLE.CTX_INIT = False
+    cfg.TRAINER.CSDG.STYLE.CSC = False
+    cfg.TRAINER.CSDG.STYLE.USE_DOMAIN_ID = True
+    cfg.TRAINER.CSDG.STYLE.DOMAIN_EMB_DIM = 32
+    cfg.TRAINER.CSDG.STYLE.DROPOUT = 0.1
+    cfg.TRAINER.CSDG.STYLE.ADAPTER_REDUCTION = 4
+
+    cfg.TRAINER.CSDG.GATE = CN()
+    cfg.TRAINER.CSDG.GATE.HIDDEN_RATIO = 16
+    cfg.TRAINER.CSDG.GATE.DROPOUT = 0.0
+    cfg.TRAINER.CSDG.GATE.SIGMOID_TEMPERATURE = 1.0
+    cfg.TRAINER.CSDG.GATE.INIT_BIAS = 2.0
+    cfg.TRAINER.CSDG.GATE.DETACH_STYLE_GRAD = False
+
+    cfg.TRAINER.CSDG.LOSS = CN()
+    cfg.TRAINER.CSDG.LOSS.STYLE_DECORR_WEIGHT = 0.1
+    cfg.TRAINER.CSDG.LOSS.GATE_ENT_WEIGHT = 0.01
+    cfg.TRAINER.CSDG.LOSS.STYLE_CE_WEIGHT = 0.2
+    cfg.TRAINER.CSDG.LOSS.ZERO_SHOT_KL_WEIGHT = 0.0
+    cfg.TRAINER.CSDG.LOSS.FUSE_MODE = "sigmoid"
 
     cfg.DATASET.SUBSAMPLE_CLASSES = "all"  # all, base or new
     """
