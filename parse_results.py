@@ -76,7 +76,8 @@ def parse_all_experiments(results_dir="/content/drive/MyDrive/CSDG"):
         metrics['exp_type'] = 'CSDG' if 'CSDG' in exp_name else 'KgCoOp'
         results.append(metrics)
 
-        print(f"✅ Parsed: {exp_name} -> {metrics['test_accuracy']:.2f}%")
+        acc_str = f"{metrics['test_accuracy']:.2f}%" if metrics['test_accuracy'] else "No accuracy found"
+        print(f"✅ Parsed: {exp_name} -> {acc_str}")
 
     return pd.DataFrame(results)
 
@@ -199,7 +200,7 @@ def generate_thesis_tables(df):
     results_table = df[['experiment', 'test_accuracy', 'alpha_mean']].copy()
     results_table.columns = ['Method', 'Accuracy (%)', 'α (Content Bias)']
     results_table['Accuracy (%)'] = results_table['Accuracy (%)'].round(2)
-    results_table['α (Content Bias)'] = results_table['α (Content Bias)'].round(3)
+    results_table['α (Content Bias)'] = results_table['α (Content Bias)'].fillna('N/A')
 
     print("=" * 60)
     print("MAIN RESULTS TABLE (for thesis)")
