@@ -66,7 +66,7 @@ run_exp "CSDG Clipart Validation" \
 
 # 2. KgCoOp baseline (modify existing config)
 run_exp "KgCoOp Direct Comparison" \
-    "python train.py --config-file configs/trainers/KgCoOp/vit_b16_ep100_ctxv1.yaml OPTIM.MAX_EPOCH 10 DATASET.NAME OfficeHomeDG DATASET.ROOT data DATASET.SOURCE_DOMAINS '[\"art\",\"product\",\"real_world\"]' DATASET.TARGET_DOMAINS '[\"clipart\"]' OUTPUT_DIR outputs/kgcoop_clipart_10ep"
+    "python train.py --config-file configs/trainers/KgCoOp/vit_b16_ep100_ctxv1.yaml TRAINER.NAME KgCoOp OPTIM.MAX_EPOCH 10 DATASET.NAME OfficeHomeDG DATASET.ROOT data DATASET.SOURCE_DOMAINS '[\"art\",\"product\",\"real_world\"]' DATASET.TARGET_DOMAINS '[\"clipart\"]' OUTPUT_DIR outputs/kgcoop_clipart_10ep"
 
 # 3. Ablations (modify CSDG config)
 run_exp "CSDG No Gating (Content Only)" \
@@ -86,7 +86,7 @@ if [[ "$INCLUDE_BONUS" == true ]]; then
         "python train.py --config-file configs/trainers/CSDG/office_home_clipart_standard.yaml DATASET.TARGET_DOMAINS '[\"art\"]' OUTPUT_DIR outputs/csdg_art_50ep"
 
     run_exp "KgCoOp Full Art Domain" \
-        "python train.py --config-file configs/trainers/KgCoOp/vit_b16_ep100_ctxv1.yaml DATASET.NAME OfficeHomeDG DATASET.ROOT data DATASET.SOURCE_DOMAINS '[\"art\",\"product\",\"real_world\"]' DATASET.TARGET_DOMAINS '[\"art\"]' OUTPUT_DIR outputs/kgcoop_art_50ep"
+        "python train.py --config-file configs/trainers/KgCoOp/vit_b16_ep100_ctxv1.yaml TRAINER.NAME KgCoOp DATASET.NAME OfficeHomeDG DATASET.ROOT data DATASET.SOURCE_DOMAINS '[\"art\",\"product\",\"real_world\"]' DATASET.TARGET_DOMAINS '[\"art\"]' OUTPUT_DIR outputs/kgcoop_art_50ep"
 fi
 
 if [[ "$DRY_RUN" == true ]]; then
